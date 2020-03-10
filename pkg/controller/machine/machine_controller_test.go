@@ -6,16 +6,41 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/elb"
+	"github.com/golang/mock/gomock"
+	mockawsclient "github.com/openshift/cloud-ingress-operator/pkg/awsclient/mock"
 	machineapiv1 "github.com/openshift/machine-api-operator/pkg/apis/machine/v1beta1"
+	"github.com/stretchr/testify/assert"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/kubectl/pkg/scheme"
 	awsproviderapi "sigs.k8s.io/cluster-api-provider-aws/pkg/apis/awsproviderconfig/v1beta1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	mockclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 var (
 	_ reconcile.Reconciler = &ReconcileMachine{}
 )
+
+type mocks struct {
+	mockClient    client.Client
+	mockCtrl      *gomock.Controller
+	mockAWSClient *mockawsclient.MockClient
+}
+
+// setupDefaultMocks is an easy way to setup all of the default mocks
+func setupDefaultMocks(t *testing.T, localObjects []runtime.Object) *mocks {
+	mocks := &mocks{
+		mockClient: mockclient.NewFakeClient(localObjects...),
+		mockCtrl:   gomock.NewController(t),
+	}
+
+	mocks.mockAWSClient = mockawsclient.NewMockClient(mocks.mockCtrl)
+
+	return mocks
+}
 
 func TestReconcileRequest(t *testing.T) {
 	awsCodec, err := awsproviderapi.NewCodec()
@@ -242,4 +267,36 @@ func TestReconcileRequest(t *testing.T) {
 	// function? This may be difficult as reconcile function works with
 	// machineapiv1 Machine objects and instance IDs are found in awsproviderapi
 	// AWSMachineProviderStatus objects
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			// ARRANGE
+			mocks := setupDefaultMocks(t, test.localObjects)
+			test.setup(mocks.mockDMSClient.EXPECT())
+
+			// This is necessary for the mocks to report failures like methods not being called an expected number of times.
+			// after mocks is defined
+			defer mocks.mockCtrl.Finish()
+
+			rm := &ReconcileMachine{
+				client: mocks.mockClient,
+				scheme: scheme.Scheme,
+			}
+
+			// ACT
+			_, err := rdms.Reconcile(reconcile.Request{
+				NamespacedName: types.NamespacedName{
+					Name:      testClusterName,
+					Namespace: testNamespace,
+				},
+			})
+
+			// ASSERT
+			//assert.Equal(t, test.expectedGetError, getErr)
+
+			assert.NoError(t, err, "Unexpected Error")
+			assert.True(t, test.verifySyncSets(mocks.fakeKubeClient, test.expectedSyncSets))
+			assert.True(t, test.verifySecret(mocks.fakeKubeClient, test.expectedSecret))
+		})
+	}
 }
