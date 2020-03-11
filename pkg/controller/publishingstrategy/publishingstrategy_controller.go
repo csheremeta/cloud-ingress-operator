@@ -3,14 +3,16 @@ package publishingstrategy
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 
 	"github.com/aws/aws-sdk-go/aws/awserr"
-
 	cloudingressv1alpha1 "github.com/openshift/cloud-ingress-operator/pkg/apis/cloudingress/v1alpha1"
 	"github.com/openshift/cloud-ingress-operator/pkg/awsclient"
 	"github.com/openshift/cloud-ingress-operator/pkg/config"
 	utils "github.com/openshift/cloud-ingress-operator/pkg/controller/utils"
+	machineapi "github.com/openshift/machine-api-operator/pkg/apis/machine/v1beta1"
+	awsproviderapi "sigs.k8s.io/cluster-api-provider-aws/pkg/apis/awsproviderconfig/v1beta1"
 
 	// corev1 "k8s.io/api/core/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
@@ -114,6 +116,12 @@ func (r *ReconcilePublishingStrategy) Reconcile(request reconcile.Request) (reco
 		return reconcile.Result{}, err
 	}
 
+	masterList, err := utils.GetMasterNodes(r.client)
+	if err != nil {
+		log.Error(err, "Couldn't fetch list of master nodes")
+		return reconcile.Result{}, err
+	}
+
 	domainName, err := utils.GetClusterBaseDomain(r.client) // in form of ```samn-test.j5u3.s1.devshift.org```
 	if err != nil {
 		log.Error(err, "Couldn't obtain the cluster's base domain")
@@ -141,12 +149,22 @@ func (r *ReconcilePublishingStrategy) Reconcile(request reconcile.Request) (reco
 
 		var intDNSName string
 		var intHostedZoneID string
+		var extDNSName string
+		var extHostedZoneID string
 		// delete the external NLB
 		for _, loadBalancer := range loadBalancerInfo {
 			if loadBalancer.Scheme == "internet-facing" {
-				err := awsClient.DeleteExternalLoadBalancer(loadBalancer.LoadBalancerArn)
+				extDNSName = loadBalancer.DNSName
+				extHostedZoneID = loadBalancer.CanonicalHostedZoneNameID
+				err := RemoveLBFromMasterMachines(r.client, extDNSName, masterList)
+				if err != nil {
+					log.Error(err, "Error removing external LB from master machine objects")
+					return reconcile.Result{}, err
+				}
+				err = awsClient.DeleteExternalLoadBalancer(loadBalancer.LoadBalancerArn)
 				if err != nil {
 					log.Error(err, "error deleting external LB")
+					return reconcile.Result{}, err
 				}
 				log.Info(fmt.Sprintf("external LB %v deleted", loadBalancer.LoadBalancerArn))
 			}
@@ -262,4 +280,29 @@ func (r *ReconcilePublishingStrategy) Reconcile(request reconcile.Request) (reco
 		return reconcile.Result{}, nil
 	}
 	return reconcile.Result{}, nil
+}
+
+func RemoveLBFromMasterMachines(kclient client.Client, elbName string, masterNodes *machineapi.MachineList) error {
+	for _, machineObj := range masterNodes.Items {
+		baseToPatch := client.MergeFrom(machineObj.DeepCopy())
+		providerSpecObj := interface{}(machineObj.Spec.ProviderSpec).(*awsproviderapi.AWSMachineProviderConfig)
+		lbList := providerSpecObj.LoadBalancers
+		newLBList := []awsproviderapi.LoadBalancerReference{}
+		for _, lb := range lbList {
+			if lb.Name != elbName {
+				newLBList = append(newLBList, lb)
+			}
+		}
+		if !reflect.DeepEqual(lbList, newLBList) {
+			providerSpecObj.LoadBalancers = newLBList
+			machineObj.Spec.ProviderSpec = interface{}(providerSpecObj).(machineapi.ProviderSpec)
+			machine := interface{}(machineObj).(runtime.Object)
+			if err := kclient.Patch(context.Background(), machine, baseToPatch); err != nil {
+				log.Error(err, "Failed to update LBs in machine's providerSpec", "machine", machineObj.Name)
+				return err
+			}
+		}
+
+	}
+	return nil
 }
